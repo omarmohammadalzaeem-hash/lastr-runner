@@ -1,0 +1,1983 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>NEON RUNNER</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #0a0a0f;
+    touch-action: none;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ─── Audio Engine ───────────────────────────────────────────────────────────
+class AudioEngine {
+  constructor() { this.ctx = null; }
+
+  init() {
+    if (!this.ctx) {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+  }
+
+  playTone(freq, type, duration, vol = 0.1, slideTo, offset = 0) {
+    if (!this.ctx) return;
+    const osc  = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = type;
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+    const t = this.ctx.currentTime + offset;
+    osc.frequency.setValueAtTime(freq, t);
+    if (slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, t + duration);
+    gain.gain.setValueAtTime(vol, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+    osc.start(t);
+    osc.stop(t + duration);
+  }
+
+  laneSwitch()    { this.playTone(220, 'sine',     0.08, 0.10, 440); }
+  nearMiss()      { [440,554,659].forEach((f,i) => this.playTone(f, 'square', 0.06, 0.05, undefined, i*0.06)); }
+  spawn()         { this.playTone(50,  'sawtooth', 0.10, 0.03); }
+  scoreMilestone(){ [523.25,659.25,783.99,1046.50].forEach((f,i) => this.playTone(f,'sine',0.15,0.10,undefined,i*0.10)); }
+  highScore()     { [523.25,659.25,783.99,1046.50,1318.51].forEach((f,i) => this.playTone(f,'square',0.20,0.10,undefined,i*0.12)); }
+  gameOver()      { this.playTone(440, 'sawtooth', 0.50, 0.15, 110); }
+  comboUp()       { this.playTone(880, 'sine',     0.15, 0.10, 1760); }
+  
+  alarm(freq, duration) { this.playTone(freq, 'square', duration, 0.1); }
+  restoreChime() { [523.25, 659.25, 783.99].forEach((f,i) => this.playTone(f, 'sine', 0.08, 0.1, undefined, i*0.08)); }
+  comboRipple() { this.playTone(1200, 'sine', 0.1, 0.1); }
+  eventAnnounce() { [220, 277, 330].forEach((f,i) => this.playTone(f, 'sawtooth', 0.4, 0.1, undefined, i*0.02)); }
+  objectiveComplete() { [523.25, 659.25, 783.99, 1046.50].forEach((f,i) => this.playTone(f, 'sine', 0.12, 0.1, undefined, i*0.12)); }
+  inversionStart() { this.playTone(200, 'sawtooth', 0.3, 0.15, 400); }
+
+  // ── Dynamic Event sounds ──────────────────────────────────────────────────
+  glitchWarnBlip() { this.playTone(200 + Math.random()*500, 'square', 0.03, 0.05); }
+  glitchStingIn()  { this.playTone(300, 'sawtooth', 1.1, 0.08, 55); }
+  glitchStingOut() { this.playTone(500, 'sine', 0.3, 0.08, 900); }
+  glitchZap()      { this.playTone(80 + Math.random()*900, 'square', 0.05, 0.06); }
+  blackoutHum()    { this.playTone(45 + Math.random()*15, 'sine', 1.8, 0.045); }
+  blackoutIn()     { this.playTone(70, 'sine', 1.5, 0.06); }
+  rushWarn()       { this.playTone(500, 'square', 0.35, 0.09, 1000); }
+  rushIn()         { this.playTone(660, 'square', 0.5, 0.11, 1500); }
+  rushPulse()      { this.playTone(800 + Math.random()*500, 'square', 0.07, 0.07); }
+
+  // ── Risk / Reward Portal sounds ───────────────────────────────────────────
+  portalHum()   { this.playTone(500 + Math.random()*80, 'sine', 0.5, 0.04, 700); }
+  portalEnter() { [180,260,340,520,700].forEach((f,i) => this.playTone(f, 'sawtooth', 0.35, 0.11, undefined, i*0.05)); }
+  riskPulse()   { this.playTone(60 + Math.random()*30, 'sawtooth', 0.5, 0.045); }
+  riskEnd()     { [700,500,300].forEach((f,i) => this.playTone(f, 'sine', 0.3, 0.08, undefined, i*0.08)); }
+
+  // ── Progression System sounds ─────────────────────────────────────────────
+  coinCollect() { [988,1319].forEach((f,i) => this.playTone(f, 'sine', 0.12, 0.09, undefined, i*0.05)); }
+  xpTick()      { this.playTone(700, 'triangle', 0.05, 0.04, 900); }
+  levelUp()     { [523.25,659.25,783.99,1046.50,1318.51,1567.98].forEach((f,i) => this.playTone(f, 'square', 0.22, 0.11, undefined, i*0.09)); }
+}
+const audio = new AudioEngine();
+
+// ─── Player Profile (persistent progression) ─────────────────────────────────
+const PROFILE_KEY = 'neonRunnerProfile';
+
+class PlayerProfile {
+  constructor() {
+    this.coins             = 0;
+    this.totalCoinsEarned  = 0;
+    this.gamesPlayed       = 0;
+    this.totalDistance     = 0;   // in world units
+    this.totalPlayTime     = 0;   // in seconds
+    this.highestScore      = 0;
+    this.xp                = 0;   // XP progress within current level
+    this.level              = 1;
+    this.load();
+  }
+
+  // XP required to advance FROM this level to the next - grows each level
+  xpForLevel(level) {
+    return Math.floor(100 * Math.pow(level, 1.55));
+  }
+
+  load() {
+    try {
+      const raw = localStorage.getItem(PROFILE_KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        if (data && typeof data === 'object') {
+          this.coins            = data.coins            ?? 0;
+          this.totalCoinsEarned = data.totalCoinsEarned  ?? 0;
+          this.gamesPlayed      = data.gamesPlayed       ?? 0;
+          this.totalDistance    = data.totalDistance     ?? 0;
+          this.totalPlayTime    = data.totalPlayTime     ?? 0;
+          this.highestScore     = data.highestScore      ?? 0;
+          this.xp               = data.xp                ?? 0;
+          this.level             = data.level             ?? 1;
+        }
+      }
+    } catch (e) {
+      // Corrupt or inaccessible storage - fall back to fresh defaults
+    }
+  }
+
+  save() {
+    try {
+      localStorage.setItem(PROFILE_KEY, JSON.stringify({
+        coins:            this.coins,
+        totalCoinsEarned: this.totalCoinsEarned,
+        gamesPlayed:      this.gamesPlayed,
+        totalDistance:    this.totalDistance,
+        totalPlayTime:    this.totalPlayTime,
+        highestScore:     this.highestScore,
+        xp:               this.xp,
+        level:             this.level
+      }));
+    } catch (e) {
+      // Storage may be unavailable (private browsing, quota) - fail silently
+    }
+  }
+
+  addCoins(n) {
+    this.coins            += n;
+    this.totalCoinsEarned += n;
+  }
+
+  // Returns true if this XP grant caused one or more level-ups
+  addXP(amount) {
+    this.xp += amount;
+    let leveledUp = false;
+    while (this.xp >= this.xpForLevel(this.level)) {
+      this.xp -= this.xpForLevel(this.level);
+      this.level++;
+      leveledUp = true;
+    }
+    return leveledUp;
+  }
+}
+
+// ─── Obstacle Types ──────────────────────────────────────────────────────────
+const OT = { STATIC:0, MOVING:1, PHANTOM:2, FAST:3, GATE:4, LASER:5 };
+
+// ─── Game Engine ─────────────────────────────────────────────────────────────
+class GameEngine {
+  constructor() {
+    this.width  = 800;
+    this.height = 600;
+    this.state  = 'MENU'; // MENU | PLAYING | DEATH | GAMEOVER
+    this.gameOverStartTime = 0;
+
+    this.playerLane = 1;
+    this.playerX    = 400;
+    this.playerY    = 500;
+    this.targetX    = 400;
+    this.playerVX   = 0;
+    this.playerAngle = 0;
+    this.playerScale = 1.0;
+    this.settledInLane = true;
+    this.playerTrail = [];
+
+    this.score        = 0;
+    this.highScore    = 0;
+    this.combo        = 1;
+    this.comboCounter = 0;
+    this.maxComboReached = 1;
+    this.nearMissCount = 0;
+    this.obstaclesDodged = 0;
+
+    this.speed     = 400;
+    this.speedMult = 1;
+
+    this.inverted       = false;
+    this.inversionState = 'IDLE'; // IDLE | WARNING | ACTIVE
+    this.inversionWarningTimer = 0;
+    this.inversionBeepCount = 0;
+    this.invertTimer    = 0;
+    this.nextInvertTime = 10;
+
+    this.gridYOffset = 0;
+    this.shakeTime   = 0;
+    this.deathTimer  = 0;
+    this.flashTimer  = 0;
+    this.flashColor  = '';
+    this.newRecord   = false;
+    this.isHighScoring = false;
+
+    this.obstacles  = [];
+    this.particles  = Array.from({length: 150}, () => ({life: 0}));
+    this.texts      = [];
+    this.speedLines = [];
+    
+    this.stars = Array.from({length: 60}, () => ({
+      x: Math.random() * 2000, y: Math.random() * 2000, phase: Math.random() * Math.PI * 2
+    }));
+    this.nebulae = Array.from({length: 3}, () => ({
+      x: Math.random(), y: Math.random(), r: 0.3 + Math.random()*0.2,
+      vx: (Math.random()-0.5)*0.02, vy: (Math.random()-0.5)*0.02,
+      color: Math.random() > 0.5 ? 'rgba(68,0,170,' : 'rgba(0,255,255,'
+    }));
+
+    this.gameTime          = 0;
+    this.distanceTraveled  = 0;
+    this.nextSpawnDistance = 300;
+    
+    this.currentEvent = null;
+    this.eventTimer = 0;
+    this.eventBanner = '';
+    this.eventBannerTimer = 0;
+    this.gauntletRemaining = 0;
+    this.ripple = { active: false, radius: 0, maxRadius: 800, x: 0, y: 0 };
+
+    // ── Dynamic Events state (GLITCH MODE / BLACKOUT / SPEED RUSH) ──────────
+    // dynPhase: IDLE -> WARNING -> ACTIVE -> ENDING -> IDLE
+    this.dynType   = null;   // 'GLITCH' | 'BLACKOUT' | 'SPEEDRUSH'
+    this.dynPhase  = 'IDLE';
+    this.dynWarningTimer = 0;
+    this.dynTimer  = 0;
+    this.dynIntensity = 0;   // 0..1 smooth in/out driver for all visuals
+    this.glitchInverted = false;
+    this.glitchSlices = [];
+    this.nextDynEventTime = 15 + Math.random() * 15;
+
+    // ── Risk / Reward Portal state ───────────────────────────────────────────
+    this.portals = [];
+    this.nextPortalDistance = 700 + Math.random() * 400;
+    // riskPhase: IDLE -> ACTIVE -> ENDING -> IDLE
+    this.riskPhase = 'IDLE';
+    this.riskTimer = 0;
+    this.riskIntensity = 0;   // 0..1 smooth in/out driver, mirrors dynIntensity pattern
+    this.riskScoreMult = 2;   // chosen as 2 or 3 on entry
+    
+    // ── Progression System state ─────────────────────────────────────────────
+    this.profile = new PlayerProfile();
+
+    this.coins = [];                                  // in-run collectible neon coins
+    this.nextCoinDistance = 150 + Math.random() * 150;
+
+    this.sessionCoinsEarned = 0;                       // coins collected this run
+    this.sessionXPEarned    = 0;                       // XP earned this run
+    this.survivalXPAccum    = 0;                       // seconds accumulator for survival XP trickle
+
+    this.levelUpTimer   = 0;                           // drives the level-up celebration animation
+    this.levelUpLevel   = this.profile.level;
+
+    this.mouseX = 0;
+    this.mouseY = 0;
+    this.hoverPlay = false;
+    this.hoverRestart = false;
+
+    this.allObjectives = [
+      { id: 'survive', text: 'Survive 30s', target: 30, get: () => this.gameTime },
+      { id: 'near_miss', text: '5 Near Misses', target: 5, get: () => this.nearMissCount },
+      { id: 'combo', text: 'Reach Combo x5', target: 5, get: () => this.maxComboReached },
+      { id: 'dodge', text: 'Dodge 20 obst.', target: 20, get: () => this.obstaclesDodged },
+      { id: 'score', text: 'Score 1000', target: 1000, get: () => this.score }
+    ];
+    this.activeObjectives = [];
+
+    const hs = localStorage.getItem('neonRunnerHighScore');
+    if (hs) this.highScore = parseInt(hs, 10);
+    this._initSpeedLines();
+  }
+
+  _initSpeedLines() {
+    this.speedLines = Array.from({length: 20}, () => ({
+      x: Math.random() * 3000,
+      y: Math.random() * 3000,
+      length: 20 + Math.random() * 80,
+      speed:  1.5 + Math.random() * 1.0
+    }));
+  }
+
+  resize(w, h) {
+    this.width   = w;
+    this.height  = h;
+    this.playerY = h * 0.8;
+    this.targetX = this._laneX(this.playerLane);
+    this.playerX = this.targetX;
+  }
+
+  _laneX(lane) {
+    return this.width * (lane / 3) + (this.width / 6);
+  }
+
+  handleInput(action) {
+    if (this.state === 'MENU' || this.state === 'GAMEOVER') {
+      if (action === 'ACTION') this.startGame();
+      return;
+    }
+    if (this.state === 'PLAYING') {
+      // XOR the two independent inversion sources (built-in inversion event + Glitch Mode)
+      const inv = this.inverted !== this.glitchInverted;
+      if (action === 'LEFT')  this._movePlayer(inv ?  1 : -1);
+      if (action === 'RIGHT') this._movePlayer(inv ? -1 :  1);
+    }
+  }
+
+  _movePlayer(dir) {
+    const nl = this.playerLane + dir;
+    if (nl >= 0 && nl <= 2) {
+      this.playerLane = nl;
+      audio.laneSwitch();
+    }
+  }
+
+  startGame() {
+    this.state        = 'PLAYING';
+    this.score        = 0;
+    this.combo        = 1;
+    this.comboCounter = 0;
+    this.maxComboReached = 1;
+    this.nearMissCount = 0;
+    this.obstaclesDodged = 0;
+    this.speed        = 400;
+    this.obstacles    = [];
+    this.particles.forEach(p => p.life = 0);
+    this.texts        = [];
+    this.playerTrail  = [];
+    this.playerLane   = 1;
+    this.targetX      = this._laneX(1);
+    this.playerX      = this.targetX;
+    this.playerVX     = 0;
+    this.playerAngle  = 0;
+    this.playerScale  = 1.0;
+    this.settledInLane = true;
+    
+    this.inverted       = false;
+    this.inversionState = 'IDLE';
+    
+    this.gameTime     = 0;
+    this.nextInvertTime    = 8 + Math.random() * 12;
+    this.distanceTraveled  = 0;
+    this.nextSpawnDistance = 300;
+    this.newRecord         = false;
+    this.isHighScoring     = false;
+    
+    this.currentEvent = null;
+    this.eventTimer = 0;
+    this.eventBannerTimer = 0;
+    this.gauntletRemaining = 0;
+    this.ripple.active = false;
+
+    // Reset Dynamic Events
+    this.dynType = null;
+    this.dynPhase = 'IDLE';
+    this.dynWarningTimer = 0;
+    this.dynTimer = 0;
+    this.dynIntensity = 0;
+    this.glitchInverted = false;
+    this.glitchSlices = [];
+    this.nextDynEventTime = this.gameTime + 15 + Math.random() * 15;
+
+    // Reset Risk / Reward Portal system
+    this.portals = [];
+    this.nextPortalDistance = 700 + Math.random() * 400;
+    this.riskPhase = 'IDLE';
+    this.riskTimer = 0;
+    this.riskIntensity = 0;
+    this.riskScoreMult = 2;
+    
+    const shuffled = [...this.allObjectives].sort(() => 0.5 - Math.random());
+    this.activeObjectives = shuffled.slice(0, 3).map(o => ({
+      ...o, completed: false, flashTimer: 0
+    }));
+
+    // Reset progression session state (persistent totals in this.profile are untouched)
+    this.coins = [];
+    this.nextCoinDistance = 150 + Math.random() * 150;
+    this.sessionCoinsEarned = 0;
+    this.sessionXPEarned    = 0;
+    this.survivalXPAccum    = 0;
+    this.levelUpTimer = 0;
+
+    this.profile.gamesPlayed++;
+    this.profile.save();
+
+    audio.spawn();
+  }
+
+  _flash(color, duration) {
+    this.flashColor = color;
+    this.flashTimer = duration;
+  }
+
+  _spawnParticle(x, y, vx, vy, life, color) {
+    for(let i=0; i<this.particles.length; i++) {
+      if (this.particles[i].life <= 0) {
+        const p = this.particles[i];
+        p.x = x; p.y = y; p.vx = vx; p.vy = vy; p.life = life; p.color = color;
+        return;
+      }
+    }
+  }
+
+  // ── Progression System: XP & Levels ───────────────────────────────────────
+  _awardXP(amount, x, y, showText = true) {
+    if (amount <= 0) return;
+    this.sessionXPEarned += amount;
+
+    if (showText) {
+      this.texts.push({
+        id: Math.random(), text: `+${amount} XP`, x, y,
+        color: '#66ddff', life: 0.9
+      });
+    }
+
+    const leveledUp = this.profile.addXP(amount);
+    this.profile.save();
+    if (leveledUp) this._triggerLevelUp();
+  }
+
+  _triggerLevelUp() {
+    this.levelUpTimer = 2.4;
+    this.levelUpLevel = this.profile.level;
+    this._flash('#ffdd33', 0.5);
+    audio.levelUp();
+    for (let i = 0; i < 36; i++) {
+      const angle = (Math.PI * 2 / 36) * i;
+      const spd = 150 + Math.random() * 300;
+      this._spawnParticle(this.playerX, this.playerY, Math.cos(angle) * spd, Math.sin(angle) * spd, 1.1, '#ffd700');
+    }
+  }
+
+  // ── Progression System: Neon Coins ────────────────────────────────────────
+  _maybeSpawnCoin() {
+    // Coins are simple, low-friction pickups - avoid stacking them with obstacle-heavy events
+    if (this.distanceTraveled < this.nextCoinDistance) return;
+    const lane = Math.floor(Math.random() * 3);
+    this.coins.push({
+      id: Math.random(), lane, y: -70,
+      radius: Math.max(13, this.width * 0.020),
+      phase: Math.random() * Math.PI * 2,
+      spin: 0
+    });
+    this.nextCoinDistance = this.distanceTraveled + 240 + Math.random() * 260;
+  }
+
+  _updateCoins(dt, spd) {
+    const pSize = Math.max(20, Math.min(60, this.width * 0.04));
+    for (let i = this.coins.length - 1; i >= 0; i--) {
+      const c = this.coins[i];
+      c.y += spd * dt;
+      c.phase += dt * 5;
+      c.spin  += dt * 4;
+
+      const ox = this._laneX(c.lane);
+      const dx = this.playerX - ox, dy = this.playerY - c.y;
+      if (Math.sqrt(dx * dx + dy * dy) < c.radius + pSize * 0.4) {
+        this._collectCoin(ox, c.y);
+        this.coins.splice(i, 1);
+        continue;
+      }
+      if (c.y > this.height + 100) this.coins.splice(i, 1);
+    }
+  }
+
+  _collectCoin(x, y) {
+    const coinValue = 1;
+    this.profile.addCoins(coinValue);
+    this.sessionCoinsEarned += coinValue;
+    this.profile.save();
+
+    for (let k = 0; k < 14; k++) {
+      const angle = Math.random() * Math.PI * 2;
+      const spd = 90 + Math.random() * 180;
+      this._spawnParticle(x, y, Math.cos(angle) * spd, Math.sin(angle) * spd, 0.6, '#ffd700');
+    }
+    this.texts.push({ id: Math.random(), text: '+1', x, y: y - 20, color: '#ffd700', life: 0.8 });
+    audio.coinCollect();
+
+    this._awardXP(5, x, y - 44);
+  }
+
+  _spawnWave() {
+    // Dynamic Events must not overlap with the existing scripted events, each other, or Risk Mode
+    if (!this.currentEvent && this.dynPhase === 'IDLE' && this.riskPhase === 'IDLE' && this.state === 'PLAYING') {
+      let r = Math.random();
+      if (this.score > 2000 && r < 0.04) {
+        this.currentEvent = 'BLIND_RUSH'; this.eventTimer = 3.0; this.eventBanner = 'BLIND RUSH!'; this.eventBannerTimer = 2.0; audio.eventAnnounce();
+      } else if (this.score > 1500 && r < 0.10) {
+        this.currentEvent = 'SCORE_SURGE'; this.eventTimer = 5.0; this.eventBanner = 'SCORE SURGE!'; this.eventBannerTimer = 2.0; audio.eventAnnounce();
+      } else if (this.score > 1000 && r < 0.15) {
+        this.currentEvent = 'GAUNTLET'; this.gauntletRemaining = 5; this.eventBanner = 'GAUNTLET!'; this.eventBannerTimer = 2.0; audio.eventAnnounce();
+      } else if (this.score > 500 && r < 0.23) {
+        this.currentEvent = 'TIME_WARP'; this.eventTimer = 4.0; this.eventBanner = 'TIME WARP!'; this.eventBannerTimer = 2.0; audio.eventAnnounce();
+      }
+    }
+
+    if (this.currentEvent === 'GAUNTLET') {
+      if (this.gauntletRemaining > 0) {
+        this.gauntletRemaining--;
+        const lane = Math.floor(Math.random()*3);
+        this.obstacles.push({
+          id: Math.random(), type: OT.FAST, lane, y: -50,
+          width: this.width * 0.20, height: this.height * 0.04,
+          passed: false, nearMissTriggered: false, movingTime: 0, phantomOpacity: 1,
+          isGauntletLast: this.gauntletRemaining === 0
+        });
+        this.nextSpawnDistance = this.distanceTraveled + 150;
+        return;
+      }
+    }
+
+    if (this.score > 1000 && Math.random() < 0.1) {
+      const safeLane = Math.floor(Math.random()*3);
+      this.obstacles.push({
+        id: Math.random(), type: OT.LASER, lane: 1, safeLane, y: -50,
+        width: this.width, height: 10,
+        passed: false, nearMissTriggered: false, movingTime: 0, phantomOpacity: 1
+      });
+      return;
+    }
+
+    const isHard   = this.score > 2000 || this.riskPhase !== 'IDLE'; // Risk Mode: harder obstacle patterns
+    const isMedium = this.score >  500  || this.riskPhase !== 'IDLE';
+
+    const archetypes = ['SINGLE','GATE'];
+    if (isMedium) archetypes.push('MOVING','DOUBLE');
+    if (isHard)   archetypes.push('PHANTOM','FAST','DIAGONAL');
+
+    const arch = archetypes[Math.floor(Math.random() * archetypes.length)];
+
+    const spawn = (type, lane, yOff = 0) => {
+      this.obstacles.push({
+        id: Math.random(), type, lane,
+        y: -50 - yOff,
+        width:  this.width  * 0.20,
+        height: this.height * 0.04,
+        passed: false, nearMissTriggered: false,
+        movingTime: 0, phantomOpacity: 0.8
+      });
+    };
+
+    if      (arch === 'SINGLE')   spawn(OT.STATIC,  Math.floor(Math.random()*3));
+    else if (arch === 'GATE')     spawn(OT.GATE,    Math.floor(Math.random()*3));
+    else if (arch === 'MOVING')   spawn(OT.MOVING,  Math.floor(Math.random()*3));
+    else if (arch === 'PHANTOM')  spawn(OT.PHANTOM, Math.floor(Math.random()*3));
+    else if (arch === 'FAST')     spawn(OT.FAST,    Math.floor(Math.random()*3));
+    else if (arch === 'DOUBLE') {
+      const safe = Math.floor(Math.random()*3);
+      [0,1,2].filter(l => l !== safe).forEach(l => spawn(OT.STATIC, l));
+    } else if (arch === 'DIAGONAL') {
+      const start = Math.random() > 0.5 ? 0 : 2;
+      const step  = start === 0 ? 1 : -1;
+      for (let i = 0; i < 3; i++) spawn(OT.STATIC, start + i*step, i * this.height * 0.15);
+    }
+
+    audio.spawn();
+  }
+
+  _die() {
+    this.state      = 'DEATH';
+    this.deathTimer = 0.4;
+    this.shakeTime  = 0.5;
+
+    // Cleanly cancel any in-progress Dynamic Event so it doesn't bleed into GAMEOVER/MENU
+    this.dynPhase = 'IDLE';
+    this.dynType = null;
+    this.dynIntensity = 0;
+    this.dynWarningTimer = 0;
+    this.glitchInverted = false;
+
+    // Cleanly cancel Risk Mode / portals as well
+    this.riskPhase = 'IDLE';
+    this.riskIntensity = 0;
+    this.riskTimer = 0;
+    this.portals = [];
+
+    for (let i = 0; i < 24; i++) {
+      const angle = (Math.PI * 2 / 24) * i;
+      const spd   = 200 + Math.random() * 400;
+      this._spawnParticle(this.playerX, this.playerY, Math.cos(angle) * spd, Math.sin(angle) * spd, 1.0, '#00ffff');
+    }
+    audio.gameOver();
+  }
+
+  _checkCollisions() {
+    const pSize = Math.max(20, Math.min(60, this.width * 0.04));
+    const pR = {
+      left:   this.playerX - pSize/2, right: this.playerX + pSize/2,
+      top:    this.playerY - pSize/2, bottom: this.playerY + pSize/2
+    };
+
+    for (const obs of this.obstacles) {
+      if (obs.passed) continue;
+
+      let ox = this._laneX(obs.lane);
+      if (obs.type === OT.MOVING) {
+        ox += Math.sin(obs.movingTime) * (this.width / 3);
+        ox  = Math.max(this.width/6, Math.min(this.width*5/6, ox));
+      }
+
+      const oR = {
+        left:   ox - obs.width/2,  right: ox + obs.width/2,
+        top:    obs.y - obs.height/2, bottom: obs.y + obs.height/2
+      };
+      
+      if (obs.type === OT.LASER) {
+        if (pR.top < obs.y + 5 && pR.bottom > obs.y - 5) {
+          const gapX = this._laneX(obs.safeLane);
+          const gapLeft = gapX - this.width * 0.12;
+          const gapRight = gapX + this.width * 0.12;
+          if (pR.left < gapLeft || pR.right > gapRight) {
+            this._die(); return;
+          } else {
+            if (!obs.passed) {
+               obs.passed = true;
+               this.score += 50 * this.combo * (this.currentEvent === 'SCORE_SURGE' ? 3 : this.currentEvent === 'TIME_WARP' ? 2 : 1);
+               this.obstaclesDodged++;
+            }
+          }
+        }
+        continue;
+      }
+
+      if (pR.left < oR.right && pR.right > oR.left &&
+          pR.top  < oR.bottom && pR.bottom > oR.top) {
+
+        if (obs.type === OT.PHANTOM && obs.phantomOpacity < 0.2) continue;
+
+        if (obs.type === OT.GATE) {
+          obs.passed = true;
+          this.score += 50 * this.combo * (this.currentEvent === 'SCORE_SURGE' ? 3 : this.currentEvent === 'TIME_WARP' ? 2 : 1);
+          this.obstaclesDodged++;
+          this.texts.push({id: Math.random(), text: '+50', x: this.playerX, y: this.playerY - 40, color: '#00ff88', life: 1});
+          this._flash('#00ff88', 0.15);
+          continue;
+        }
+
+        this._die();
+        return;
+      }
+
+      // Near-miss detection
+      if (!obs.nearMissTriggered && obs.y > this.playerY - pSize && obs.y < this.playerY + pSize) {
+        if (obs.type !== OT.GATE && obs.type !== OT.PHANTOM && obs.type !== OT.LASER) {
+          const distX = Math.abs(this.playerX - ox);
+          const colDist = obs.width/2 + pSize/2;
+          if (distX > colDist && distX < colDist + 50) {
+            obs.nearMissTriggered = true;
+            this.nearMissCount++;
+            this.score += 50 * this.combo * (this.currentEvent === 'SCORE_SURGE' ? 3 : this.currentEvent === 'TIME_WARP' ? 2 : 1);
+            this.texts.push({id: Math.random(), text: '+NEAR MISS', x: this.playerX, y: this.playerY - 40, color: '#00ff88', life: 1});
+            audio.nearMiss();
+            for(let k=0; k<8; k++) {
+               const angle = Math.random() * Math.PI * 2;
+               const spd = 100 + Math.random() * 100;
+               this._spawnParticle(ox + (distX > 0 ? -obs.width/2 : obs.width/2), obs.y, Math.cos(angle)*spd, Math.sin(angle)*spd, 0.5, '#00ff88');
+            }
+            this._awardXP(8, this.playerX, this.playerY - 64);
+          }
+        }
+      }
+    }
+  }
+
+  // ── Dynamic Events: update ────────────────────────────────────────────────
+  _dynDuration(type) {
+    if (type === 'GLITCH')    return 4 + Math.random() * 2;
+    if (type === 'BLACKOUT')  return 5 + Math.random() * 2.5;
+    if (type === 'SPEEDRUSH') return 4 + Math.random() * 2;
+    return 4;
+  }
+
+  _beginDynEvent(type) {
+    this.dynType  = type;
+    this.dynPhase = 'WARNING';
+    this.dynIntensity = 0;
+    if (type === 'GLITCH') {
+      this.dynWarningTimer = 1.3;
+      this.eventBanner = 'GLITCH INCOMING';
+      audio.glitchStingIn();
+    } else if (type === 'BLACKOUT') {
+      this.dynWarningTimer = 0.9;
+      this.eventBanner = 'BLACKOUT';
+      audio.blackoutIn();
+    } else {
+      this.dynWarningTimer = 0.6;
+      this.eventBanner = 'SPEED RUSH!';
+      audio.rushWarn();
+    }
+    this.eventBannerTimer = 1.4;
+  }
+
+  _onDynActivate(type) {
+    if (type === 'GLITCH') {
+      this.glitchInverted = true;
+      this._rollGlitchSlices();
+      audio.glitchZap();
+    } else if (type === 'BLACKOUT') {
+      audio.blackoutHum();
+    } else if (type === 'SPEEDRUSH') {
+      audio.rushIn();
+    }
+  }
+
+  _rollGlitchSlices() {
+    this.glitchSlices = Array.from({length: 8}, () => ({
+      y: Math.random() * this.height,
+      h: 3 + Math.random() * 18,
+      dx: (Math.random() - 0.5) * 50,
+      color: Math.random() < 0.5 ? '#ff00ff' : '#00ffff'
+    }));
+  }
+
+  _updateDynamicEvents(dt) {
+    if (this.dynPhase === 'IDLE') {
+      if (!this.currentEvent && this.riskPhase === 'IDLE' && this.gameTime > this.nextDynEventTime) {
+        const pick = Math.random();
+        if (pick < 0.34) this._beginDynEvent('GLITCH');
+        else if (pick < 0.67) this._beginDynEvent('BLACKOUT');
+        else this._beginDynEvent('SPEEDRUSH');
+      }
+      return;
+    }
+
+    if (this.dynPhase === 'WARNING') {
+      this.dynWarningTimer -= dt;
+      if (this.dynType === 'GLITCH' && Math.random() < 0.35) audio.glitchWarnBlip();
+      if (this.dynWarningTimer <= 0) {
+        this.dynPhase = 'ACTIVE';
+        this.dynTimer = this._dynDuration(this.dynType);
+        this._onDynActivate(this.dynType);
+      }
+      return;
+    }
+
+    if (this.dynPhase === 'ACTIVE') {
+      this.dynIntensity = Math.min(1, this.dynIntensity + dt * 3.5); // smooth activation
+      this.dynTimer -= dt;
+
+      if (this.dynType === 'GLITCH') {
+        if (Math.random() < 0.22) this._rollGlitchSlices();
+        if (Math.random() < 0.10) audio.glitchZap();
+      } else if (this.dynType === 'BLACKOUT') {
+        if (Math.random() < 0.02) audio.blackoutHum();
+      } else if (this.dynType === 'SPEEDRUSH') {
+        if (Math.random() < 0.06) audio.rushPulse();
+      }
+
+      if (this.dynTimer <= 0) {
+        this.dynPhase = 'ENDING';
+        if (this.dynType === 'GLITCH') this.glitchInverted = false;
+        audio.glitchStingOut();
+      }
+      return;
+    }
+
+    if (this.dynPhase === 'ENDING') {
+      this.dynIntensity = Math.max(0, this.dynIntensity - dt * 2.5); // smooth ending
+      if (this.dynIntensity <= 0) {
+        this.dynPhase = 'IDLE';
+        this.dynType = null;
+        this.nextDynEventTime = this.gameTime + 20 + Math.random() * 25; // rare
+      }
+    }
+  }
+
+  // ── Risk / Reward Portal: spawn, move, collect ────────────────────────────
+  _maybeSpawnPortal() {
+    // Portals are optional bonus objects - never spawn one during another big system
+    if (this.riskPhase !== 'IDLE' || this.currentEvent || this.dynPhase !== 'IDLE') return;
+    if (this.distanceTraveled < this.nextPortalDistance) return;
+
+    const lane = Math.floor(Math.random() * 3);
+    this.portals.push({
+      id: Math.random(), lane, y: -90,
+      radius: Math.max(30, this.width * 0.09),
+      pulsePhase: Math.random() * Math.PI * 2
+    });
+    this.nextPortalDistance = this.distanceTraveled + 1000 + Math.random() * 600;
+    audio.portalHum();
+  }
+
+  _updatePortals(dt, spd) {
+    const pSize = Math.max(20, Math.min(60, this.width * 0.04));
+    for (let i = this.portals.length - 1; i >= 0; i--) {
+      const p = this.portals[i];
+      p.y += spd * dt;
+      p.pulsePhase += dt * 4;
+
+      // Enter the portal: player overlaps its core -> triggers Risk Mode
+      const ox = this._laneX(p.lane);
+      const dx = this.playerX - ox, dy = this.playerY - p.y;
+      if (Math.sqrt(dx * dx + dy * dy) < p.radius * 0.65 + pSize * 0.35) {
+        this.portals.splice(i, 1);
+        this._enterRiskMode();
+        continue;
+      }
+
+      // Ignored: simply scrolls off screen, game continues normally
+      if (p.y > this.height + 150) this.portals.splice(i, 1);
+    }
+  }
+
+  _enterRiskMode() {
+    this.riskPhase = 'ACTIVE';
+    this.riskTimer = 8 + Math.random() * 3; // limited time
+    this.riskIntensity = 0;                  // ramps up smoothly
+    this.riskScoreMult = Math.random() < 0.5 ? 2 : 3;
+    this.eventBanner = `RISK MODE x${this.riskScoreMult}!`;
+    this.eventBannerTimer = 1.6;
+    this._flash('#aa00ff', 0.45);
+    audio.portalEnter();
+  }
+
+  _updateRiskMode(dt) {
+    if (this.riskPhase === 'ACTIVE') {
+      this.riskIntensity = Math.min(1, this.riskIntensity + dt * 3); // smooth activation
+      this.riskTimer -= dt;
+      if (Math.random() < 0.05) audio.riskPulse();
+      if (this.riskTimer <= 0) {
+        this.riskPhase = 'ENDING';
+        audio.riskEnd();
+      }
+    } else if (this.riskPhase === 'ENDING') {
+      this.riskIntensity = Math.max(0, this.riskIntensity - dt * 2); // smooth return to normal
+      if (this.riskIntensity <= 0) this.riskPhase = 'IDLE';
+    }
+  }
+
+  update(dt) {
+    if (this.levelUpTimer > 0) this.levelUpTimer -= dt;
+
+    this.hoverPlay = this.state === 'MENU' && this.mouseX > this.width/2 - 80 && this.mouseX < this.width/2 + 80 && this.mouseY > this.height * 0.60 - 25 && this.mouseY < this.height * 0.60 + 25;
+    this.hoverRestart = this.state === 'GAMEOVER' && this.mouseX > this.width/2 - 80 && this.mouseX < this.width/2 + 80 && this.mouseY > this.height * 0.3 + 280 - 25 && this.mouseY < this.height * 0.3 + 280 + 25;
+
+    if (this.state === 'MENU' || this.state === 'GAMEOVER') {
+      this.gridYOffset += 100 * dt;
+      this._updateParticles(dt);
+      this._updateTexts(dt);
+      this._updateSpeedLines(dt);
+      return;
+    }
+
+    if (this.state === 'DEATH') {
+      this.speedMult   = 0.3;
+      this.deathTimer -= dt;
+      this.shakeTime  -= dt;
+      this._updateParticles(dt);
+      this._updateTexts(dt);
+      this._updateSpeedLines(dt);
+      if (this.deathTimer <= 0) {
+        this.state = 'GAMEOVER';
+        this.gameOverStartTime = Date.now();
+        if (this.score > this.highScore) {
+          this.highScore = Math.floor(this.score);
+          localStorage.setItem('neonRunnerHighScore', this.highScore.toString());
+          this.newRecord = true;
+          audio.highScore();
+        }
+
+        // Persist this run's totals into the player profile
+        this.profile.totalDistance += this.distanceTraveled;
+        this.profile.totalPlayTime += this.gameTime;
+        if (Math.floor(this.score) > this.profile.highestScore) {
+          this.profile.highestScore = Math.floor(this.score);
+        }
+        this.profile.save();
+
+        if (this.newRecord) {
+          this._awardXP(150, this.width/2, this.height/2 - 60);
+        }
+      }
+      return;
+    }
+
+    // PLAYING
+    this._updateDynamicEvents(dt);
+
+    this._updateRiskMode(dt);
+
+    this.speedMult = 1;
+    if (this.currentEvent === 'TIME_WARP') this.speedMult = 0.4;
+    if (this.dynType === 'SPEEDRUSH' && this.dynPhase !== 'IDLE') this.speedMult *= (1 + 0.9 * this.dynIntensity);
+    if (this.riskPhase !== 'IDLE') this.speedMult *= (1 + 0.55 * this.riskIntensity); // Risk Mode: faster gameplay
+    
+    const spd = this.speed * this.speedMult;
+    const prevScore = this.score;
+    
+    let scoreMultiplier = 1;
+    if (this.currentEvent === 'TIME_WARP') scoreMultiplier = 2;
+    if (this.currentEvent === 'SCORE_SURGE') scoreMultiplier = 3;
+    if (this.dynType === 'SPEEDRUSH' && this.dynPhase !== 'IDLE') scoreMultiplier *= (1 + this.dynIntensity);
+    if (this.riskPhase !== 'IDLE') scoreMultiplier *= (1 + (this.riskScoreMult - 1) * this.riskIntensity); // Risk Mode: 2x/3x, ramps smoothly
+    
+    this.score += spd * dt * 0.05 * scoreMultiplier;
+    this.speed += dt * 5;
+    
+    if (this.score > this.highScore && this.score > 100) this.isHighScoring = true;
+
+    if (Math.floor(this.score / 100) > Math.floor(prevScore / 100)) audio.scoreMilestone();
+
+    this.gameTime += dt;
+
+    // Survival XP: a steady trickle for simply staying alive, awarded once per whole second
+    this.survivalXPAccum += dt;
+    if (this.survivalXPAccum >= 1) {
+      const wholeSecs = Math.floor(this.survivalXPAccum);
+      this.survivalXPAccum -= wholeSecs;
+      this._awardXP(2 * wholeSecs, this.playerX, this.playerY - 34, false);
+    }
+    
+    // Inversion Logic
+    if (!this.inverted && this.gameTime > this.nextInvertTime) {
+      if (this.inversionState === 'IDLE') {
+        this.inversionState = 'WARNING';
+        this.inversionWarningTimer = 2.0;
+        this.inversionBeepCount = 0;
+      }
+    }
+    
+    if (this.inversionState === 'WARNING') {
+      if (this.inversionWarningTimer <= 2.0 && this.inversionBeepCount === 0) { audio.alarm(800, 0.15); this.inversionBeepCount++; }
+      if (this.inversionWarningTimer <= 1.5 && this.inversionBeepCount === 1) { audio.alarm(800, 0.15); this.inversionBeepCount++; }
+      if (this.inversionWarningTimer <= 1.0 && this.inversionBeepCount === 2) { audio.alarm(800, 0.15); this.inversionBeepCount++; }
+
+      this.inversionWarningTimer -= dt;
+      if (this.inversionWarningTimer <= 0) {
+        this.inversionState = 'ACTIVE';
+        this.inverted = true;
+        this.invertTimer = 3 + Math.random() * 2;
+        this._flash('#ff0000', 0.4);
+        audio.inversionStart();
+      }
+    } else if (this.inversionState === 'ACTIVE') {
+      this.invertTimer -= dt;
+      if (this.invertTimer <= 0) {
+        this.inversionState = 'IDLE';
+        this.inverted = false;
+        this.nextInvertTime = this.gameTime + 8 + Math.random() * 12;
+        this._flash('#ffffff', 0.2);
+        audio.restoreChime();
+        this.texts.push({ id: Math.random(), text: 'Controls Restored', x: this.width/2, y: this.height/2, color: '#00ff88', life: 2.0 });
+      }
+    }
+
+    this.comboCounter += dt;
+    if (this.comboCounter > 5.0) {
+      if (this.combo < 5) {
+        this.combo++;
+        if (this.combo > this.maxComboReached) this.maxComboReached = this.combo;
+        if (this.combo === 3 || this.combo === 5) {
+           this.ripple = { active: true, radius: 0, maxRadius: 1000, x: this.playerX, y: this.playerY };
+           audio.comboRipple();
+        }
+        audio.comboUp();
+      }
+      this.comboCounter = 0;
+    }
+    
+    if (this.ripple && this.ripple.active) {
+       this.ripple.radius += 1500 * dt;
+       if (this.ripple.radius > this.ripple.maxRadius) this.ripple.active = false;
+    }
+
+    if (this.flashTimer > 0) this.flashTimer -= dt;
+    if (this.eventBannerTimer > 0) this.eventBannerTimer -= dt;
+    if (this.currentEvent) {
+       this.eventTimer -= dt;
+       if (this.eventTimer <= 0 && this.currentEvent !== 'GAUNTLET') {
+         this.currentEvent = null;
+       }
+    }
+
+    this.gridYOffset += spd * dt;
+    this._updateSpeedLines(dt);
+
+    // Spring physics movement
+    this.targetX  = this._laneX(this.playerLane);
+    const springK = 200;
+    const damp = 12;
+    const force = (this.targetX - this.playerX) * springK;
+    this.playerVX = this.playerVX + (force - this.playerVX * damp) * dt;
+    this.playerX += this.playerVX * dt;
+    this.playerAngle = Math.max(-0.26, Math.min(0.26, this.playerVX / 5000));
+    
+    if (Math.abs(this.targetX - this.playerX) < 5 && Math.abs(this.playerVX) < 50 && !this.settledInLane) {
+      this.settledInLane = true;
+      this.playerScale = 1.2;
+    } else if (Math.abs(this.targetX - this.playerX) > 20) {
+      this.settledInLane = false;
+    }
+    if (this.playerScale > 1.0) {
+      this.playerScale -= dt * 2;
+      if (this.playerScale < 1.0) this.playerScale = 1.0;
+    }
+
+    this.playerTrail.push({x: this.playerX, y: this.playerY, angle: this.playerAngle, life: 0.2});
+    if (this.playerTrail.length > 5) this.playerTrail.shift();
+    for (const pt of this.playerTrail) pt.life -= dt;
+
+    for (let i = this.obstacles.length - 1; i >= 0; i--) {
+      const obs = this.obstacles[i];
+      let moveSpd = spd;
+      if (obs.type === OT.FAST) moveSpd *= 2.5;
+
+      obs.y += moveSpd * dt;
+      if (obs.type === OT.MOVING) obs.movingTime += dt * 3;
+      if (obs.type === OT.PHANTOM && obs.y > this.height * 0.2)
+        obs.phantomOpacity = Math.max(0, obs.phantomOpacity - dt * 2);
+
+      if (!obs.passed && obs.y > this.playerY + this.height * 0.05) {
+        obs.passed = true;
+        if (obs.type !== OT.LASER && obs.type !== OT.GATE) this.obstaclesDodged++;
+        if (obs.isGauntletLast) {
+           this.score += 500;
+           this.texts.push({id: Math.random(), text: '+500 GAUNTLET SURVIVED!', x: this.width/2, y: this.playerY - 60, color: '#ffd700', life: 2});
+           this.currentEvent = null;
+        }
+      }
+      if (obs.y > this.height + 100) this.obstacles.splice(i, 1);
+    }
+
+    this._updatePortals(dt, spd);
+    this._maybeSpawnPortal();
+
+    this._updateCoins(dt, spd);
+    this._maybeSpawnCoin();
+
+    this.distanceTraveled += spd * dt;
+    if (this.distanceTraveled > this.nextSpawnDistance) {
+      this._spawnWave();
+      // Risk Mode: more obstacle density (shorter gaps between spawns)
+      const riskDensity = this.riskPhase !== 'IDLE' ? (1 + 0.7 * this.riskIntensity) : 1;
+      const baseDist = Math.max(150, (600 - this.score * 0.1) / riskDensity);
+      this.nextSpawnDistance = this.distanceTraveled + baseDist + Math.random() * 200;
+    }
+
+    // Objectives tracking
+    for (const obj of this.activeObjectives) {
+      if (!obj.completed) {
+        if (obj.get() >= obj.target) {
+          obj.completed = true;
+          obj.flashTimer = 1.0;
+          this.score += 200;
+          audio.objectiveComplete();
+          this.texts.push({id: Math.random(), text: 'OBJECTIVE COMPLETE!', x: this.width/2, y: this.playerY - 80, color: '#ffd700', life: 1.5});
+          this._awardXP(60, this.width/2, this.playerY - 104);
+        }
+      } else {
+        if (obj.flashTimer > 0) obj.flashTimer -= dt;
+      }
+    }
+
+    this._updateParticles(dt);
+    this._updateTexts(dt);
+    this._checkCollisions();
+  }
+
+  _updateParticles(dt) {
+    for (let i = 0; i < this.particles.length; i++) {
+      const p = this.particles[i];
+      if (p.life > 0) {
+        p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt * 2;
+      }
+    }
+  }
+
+  _updateTexts(dt) {
+    for (let i = this.texts.length - 1; i >= 0; i--) {
+      const t = this.texts[i];
+      t.y -= 50 * dt; t.life -= dt;
+      if (t.life <= 0) this.texts.splice(i, 1);
+    }
+  }
+
+  _updateSpeedLines(dt) {
+    const spd = (this.state === 'MENU' ? 200 : this.speed) * this.speedMult;
+    for (const sl of this.speedLines) sl.y += spd * sl.speed * dt;
+  }
+
+  // ── Draw ──────────────────────────────────────────────────────────────────
+  draw(ctx) {
+    ctx.fillStyle = '#0a0a0f';
+    ctx.fillRect(0, 0, this.width, this.height);
+    
+    this._drawBackground(ctx);
+
+    ctx.save();
+    if (this.shakeTime > 0) {
+      const amt = (this.shakeTime / 0.5) * 8;
+      ctx.translate((Math.random() - 0.5) * amt, (Math.random() - 0.5) * amt);
+    }
+
+    // Dynamic Event camera work: Speed Rush intensifies the camera; Glitch adds jitter cuts
+    if (this.dynType === 'SPEEDRUSH' && this.dynPhase !== 'IDLE') {
+      const camAmt = this.dynIntensity * 4;
+      ctx.translate((Math.random() - 0.5) * camAmt, (Math.random() - 0.5) * camAmt);
+      const zoom = 1 + 0.035 * this.dynIntensity;
+      ctx.translate(this.width/2, this.height/2);
+      ctx.scale(zoom, zoom);
+      ctx.translate(-this.width/2, -this.height/2);
+    }
+    if (this.dynType === 'GLITCH' && this.dynPhase === 'ACTIVE' && Math.random() < 0.06 * this.dynIntensity) {
+      ctx.translate((Math.random() - 0.5) * 30 * this.dynIntensity, 0);
+    }
+
+    this._drawGrid(ctx);
+    this._drawSpeedLines(ctx);
+    this._drawObstacles(ctx);
+    this._drawPortals(ctx);
+    this._drawCoins(ctx);
+    
+    if (this.currentEvent === 'BLIND_RUSH') {
+      ctx.fillStyle = 'rgba(0,0,0,0.85)';
+      ctx.fillRect(0, 0, this.width, this.height);
+    }
+    if (this.currentEvent === 'TIME_WARP') {
+      ctx.fillStyle = 'rgba(128,0,255,0.15)';
+      ctx.fillRect(0, 0, this.width, this.height);
+    }
+    
+    if (this.state === 'PLAYING' || this.state === 'MENU') this._drawPlayer(ctx);
+    this._drawParticles(ctx);
+
+    // Dynamic Event overlays (drawn above player/particles, below the global flash/ripple)
+    this._drawGlitchOverlay(ctx);
+    this._drawBlackoutOverlay(ctx);
+    this._drawRiskOverlay(ctx);
+
+    if (this.inverted && this.state === 'PLAYING') {
+      ctx.fillStyle = 'rgba(255,30,0,0.12)';
+      ctx.fillRect(0, 0, this.width, this.height);
+    }
+    if (this.flashTimer > 0) {
+      ctx.globalAlpha = this.flashTimer / 0.3;
+      ctx.fillStyle   = this.flashColor;
+      ctx.fillRect(0, 0, this.width, this.height);
+      ctx.globalAlpha = 1;
+    }
+    
+    if (this.ripple && this.ripple.active) {
+       ctx.beginPath();
+       ctx.arc(this.ripple.x, this.ripple.y, this.ripple.radius, 0, Math.PI*2);
+       const alpha = Math.max(0, 1 - (this.ripple.radius / this.ripple.maxRadius));
+       ctx.strokeStyle = `rgba(0, 255, 255, ${alpha})`;
+       ctx.lineWidth = 5;
+       ctx.stroke();
+    }
+    
+    ctx.restore();
+
+    if (this.state === 'DEATH') {
+      const progress = 1 - (this.deathTimer / 0.4);
+      ctx.globalCompositeOperation = 'saturation';
+      ctx.fillStyle  = 'black';
+      ctx.globalAlpha = progress;
+      ctx.fillRect(0, 0, this.width, this.height);
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = `rgba(0,0,0,${progress * 0.5})`;
+      ctx.fillRect(0, 0, this.width, this.height);
+    }
+    
+    if (this.isHighScoring && this.state === 'PLAYING') {
+       const grad = ctx.createLinearGradient(0,0,this.width,this.height);
+       grad.addColorStop(0, 'rgba(255, 215, 0, 0.5)');
+       grad.addColorStop(1, 'rgba(255, 215, 0, 0.1)');
+       ctx.lineWidth = 30;
+       ctx.strokeStyle = grad;
+       ctx.strokeRect(15, 15, this.width - 30, this.height - 30);
+    }
+
+    this._drawLevelUpEffect(ctx);
+    this._drawUI(ctx);
+  }
+
+  _drawBackground(ctx) {
+    for (const n of this.nebulae) {
+       const grad = ctx.createRadialGradient(n.x * this.width, n.y * this.height, 0, n.x * this.width, n.y * this.height, n.r * this.width);
+       grad.addColorStop(0, n.color + '0.08)');
+       grad.addColorStop(1, 'rgba(0,0,0,0)');
+       ctx.fillStyle = grad;
+       ctx.fillRect(0, 0, this.width, this.height);
+       n.x = (n.x + n.vx * 0.01) % 1; if (n.x < 0) n.x += 1;
+       n.y = (n.y + n.vy * 0.01) % 1; if (n.y < 0) n.y += 1;
+    }
+    ctx.fillStyle = '#ffffff';
+    for (const s of this.stars) {
+       s.phase += 0.02;
+       ctx.globalAlpha = 0.3 + 0.7 * ((Math.sin(s.phase) + 1)/2);
+       ctx.fillRect(s.x % this.width, s.y % this.height, 1, 1);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  _drawGrid(ctx) {
+    const vpX = this.width / 2;
+    const vpY = 0;
+    ctx.strokeStyle = 'rgba(68,0,170,0.15)';
+    ctx.lineWidth = 1;
+    ctx.shadowBlur = 0;
+    for (let i = 0; i <= 6; i++) {
+       const tx = this.width * (i / 6);
+       ctx.beginPath();
+       ctx.moveTo(vpX, vpY);
+       ctx.lineTo(tx, this.height);
+       ctx.stroke();
+    }
+
+    // Lane dividers (Risk Mode swaps in a hot pink/magenta lighting scheme)
+    const riskLit = this.riskPhase !== 'IDLE';
+    const laneColor = riskLit ? '#ff0066' : (this.inverted ? '#ff5500' : '#4400aa');
+    ctx.strokeStyle = laneColor;
+    ctx.lineWidth   = riskLit ? 2 + 2 * this.riskIntensity : 2;
+    ctx.shadowBlur  = riskLit ? 10 + 10 * this.riskIntensity : 10;
+    ctx.shadowColor = laneColor;
+    for (let i = 1; i <= 2; i++) {
+      const x = this.width * (i / 3);
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, this.height); ctx.stroke();
+    }
+    // Horizontal scroll lines
+    ctx.shadowBlur  = 0;
+    ctx.strokeStyle = riskLit ? `rgba(255,0,100,${0.3 + 0.2*this.riskIntensity})` : 'rgba(68,0,170,0.3)';
+    const spacing   = this.height / 10;
+    for (let i = 0; i <= 11; i++) {
+      const y = (this.gridYOffset + i * spacing) % (this.height + spacing) - spacing;
+      if (y > 0 && y < this.height) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(this.width, y); ctx.stroke();
+      }
+    }
+  }
+
+  _drawSpeedLines(ctx) {
+    const rush = this.dynType === 'SPEEDRUSH' && this.dynPhase !== 'IDLE';
+    const boost = rush ? this.dynIntensity : 0;
+    ctx.strokeStyle = rush ? `rgba(0,255,255,${0.10 + 0.35*boost})` : 'rgba(255,255,255,0.10)';
+    ctx.lineWidth   = 2 + boost * 3;
+    for (const sl of this.speedLines) {
+      const sx = sl.x % this.width;
+      const sy = sl.y % this.height;
+      const len = sl.length * (1 + boost * 1.5);
+      ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx, sy + len); ctx.stroke();
+    }
+  }
+
+  _drawPlayer(ctx) {
+    const size = Math.max(20, Math.min(60, this.width * 0.04));
+    
+    for (let i = 0; i < this.playerTrail.length; i++) {
+       const pt = this.playerTrail[i];
+       if (pt.life <= 0) continue;
+       ctx.save();
+       ctx.translate(pt.x, pt.y);
+       ctx.scale(this.playerScale, this.playerScale);
+       ctx.rotate(Math.PI/4 + pt.angle);
+       ctx.globalAlpha = Math.max(0, pt.life / 0.2) * 0.3;
+       ctx.fillStyle = '#00ffff';
+       ctx.beginPath(); ctx.rect(-size/2, -size/2, size, size); ctx.fill();
+       ctx.restore();
+    }
+
+    ctx.save();
+    ctx.translate(this.playerX, this.playerY);
+    ctx.scale(this.playerScale, this.playerScale);
+    ctx.rotate(Math.PI / 4 + this.playerAngle);
+    ctx.shadowBlur   = 20;
+    ctx.shadowColor  = '#00ffff';
+    ctx.strokeStyle  = '#00ffff';
+    ctx.fillStyle    = 'rgba(0,255,255,0.2)';
+    ctx.lineWidth    = 3;
+    ctx.beginPath();
+    ctx.rect(-size/2, -size/2, size, size);
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+
+  _drawObstacles(ctx) {
+    for (const obs of this.obstacles) {
+      ctx.save();
+      let ox = this._laneX(obs.lane);
+      if (obs.type === OT.MOVING) {
+        ox += Math.sin(obs.movingTime) * (this.width / 3);
+        ox  = Math.max(this.width/6, Math.min(this.width*5/6, ox));
+      }
+
+      let alpha = obs.type === OT.PHANTOM ? obs.phantomOpacity : 1;
+      ctx.globalAlpha = alpha;
+
+      if (obs.type === OT.LASER) {
+        const gapX = this._laneX(obs.safeLane);
+        const gapLeft = gapX - this.width * 0.15;
+        const gapRight = gapX + this.width * 0.15;
+        
+        ctx.shadowBlur = 20; ctx.shadowColor = '#ff00ff';
+        ctx.strokeStyle = '#ff00ff'; ctx.lineWidth = 6;
+        ctx.beginPath();
+        ctx.moveTo(0, obs.y); ctx.lineTo(gapLeft, obs.y);
+        ctx.moveTo(gapRight, obs.y); ctx.lineTo(this.width, obs.y);
+        ctx.stroke();
+        
+        const sweepX = (this.gameTime * 1500) % this.width;
+        if (sweepX < gapLeft || sweepX > gapRight) {
+           ctx.fillStyle = '#fff';
+           ctx.beginPath(); ctx.arc(sweepX, obs.y, 4, 0, Math.PI*2); ctx.fill();
+        }
+        ctx.restore();
+        continue;
+      }
+
+      const color = obs.type === OT.GATE ? '#00ff88' : obs.type === OT.FAST ? '#ff5500' : '#ff0055';
+      ctx.shadowBlur  = 15; ctx.shadowColor = color;
+      ctx.strokeStyle = color; ctx.fillStyle = color;
+
+      if (obs.type === OT.STATIC) {
+        const pulse = 0.5 + 0.5 * Math.sin(this.gameTime * Math.PI * 2 / 0.8);
+        ctx.globalAlpha = alpha * (0.4 + 0.4 * pulse);
+        ctx.fillRect(ox - obs.width/2, obs.y - obs.height/2, obs.width, obs.height);
+        ctx.globalAlpha = alpha;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(ox - obs.width/2, obs.y - obs.height/2, obs.width, obs.height);
+      } else if (obs.type === OT.MOVING) {
+        ctx.translate(ox, obs.y);
+        ctx.rotate(obs.movingTime * 2);
+        ctx.lineWidth = 2;
+        const s = obs.width * 0.6;
+        ctx.globalAlpha = alpha * 0.3;
+        ctx.fillRect(-s/2, -s/2, s, s);
+        ctx.globalAlpha = alpha;
+        ctx.strokeRect(-s/2, -s/2, s, s);
+      } else if (obs.type === OT.PHANTOM) {
+        ctx.translate(ox, obs.y);
+        ctx.setLineDash([10, 10]);
+        ctx.beginPath();
+        for (let i = 0; i < 6; i++) {
+          const angle = (Math.PI / 3) * i;
+          const hx = Math.cos(angle) * obs.width/2;
+          const hy = Math.sin(angle) * obs.height * 1.5;
+          if (i === 0) ctx.moveTo(hx, hy); else ctx.lineTo(hx, hy);
+        }
+        ctx.closePath();
+        ctx.globalAlpha = alpha * 0.3; ctx.fill();
+        ctx.globalAlpha = alpha; ctx.lineWidth = 2; ctx.stroke();
+        ctx.setLineDash([]);
+      } else if (obs.type === OT.FAST) {
+        ctx.translate(ox, obs.y);
+        ctx.beginPath();
+        ctx.moveTo(-obs.width/2, -obs.height);
+        ctx.lineTo(0, obs.height);
+        ctx.lineTo(obs.width/2, -obs.height);
+        ctx.lineTo(0, -obs.height/2);
+        ctx.closePath();
+        ctx.globalAlpha = alpha * 0.4; ctx.fill();
+        ctx.globalAlpha = alpha; ctx.lineWidth = 2; ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(-obs.width/4, -obs.height); ctx.lineTo(-obs.width/4, -obs.height - 40);
+        ctx.moveTo(obs.width/4, -obs.height); ctx.lineTo(obs.width/4, -obs.height - 40);
+        ctx.moveTo(0, -obs.height/2); ctx.lineTo(0, -obs.height/2 - 60);
+        ctx.globalAlpha = alpha * 0.5; ctx.lineWidth = 2; ctx.stroke();
+      } else if (obs.type === OT.GATE) {
+        const pulse = 0.7 + 0.3 * Math.sin(this.gameTime * 10);
+        ctx.globalAlpha = pulse;
+        ctx.lineWidth = 4;
+        ctx.beginPath(); ctx.moveTo(ox - obs.width/2, obs.y - obs.height/2); ctx.lineTo(ox + obs.width/2, obs.y - obs.height/2); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(ox - obs.width/2, obs.y + obs.height/2); ctx.lineTo(ox + obs.width/2, obs.y + obs.height/2); ctx.stroke();
+        ctx.globalAlpha = 0.2;
+        ctx.fillRect(ox - obs.width/2, obs.y - obs.height/2, obs.width, obs.height);
+      }
+      ctx.restore();
+    }
+  }
+
+  // ── Risk / Reward Portal visuals ──────────────────────────────────────────
+  _drawPortals(ctx) {
+    for (const p of this.portals) {
+      const ox = this._laneX(p.lane);
+      const pulse = 0.6 + 0.4 * Math.sin(p.pulsePhase);
+      ctx.save();
+      ctx.translate(ox, p.y);
+
+      // Outer glowing rings (reads clearly as "special / dangerous")
+      for (let ring = 0; ring < 3; ring++) {
+        ctx.beginPath();
+        ctx.arc(0, 0, p.radius * (0.55 + ring * 0.28) * pulse, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(180,0,255,${0.55 - ring * 0.15})`;
+        ctx.lineWidth = 3;
+        ctx.shadowBlur = 20; ctx.shadowColor = '#aa00ff';
+        ctx.stroke();
+      }
+
+      // Glowing core
+      const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, p.radius);
+      grad.addColorStop(0,   'rgba(255,255,255,0.9)');
+      grad.addColorStop(0.4, 'rgba(200,0,255,0.65)');
+      grad.addColorStop(1,   'rgba(150,0,255,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(0, 0, p.radius, 0, Math.PI * 2); ctx.fill();
+
+      // Label so the player instantly reads it as risky/optional
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 12px monospace';
+      ctx.fillStyle = '#ffccff';
+      ctx.shadowBlur = 8; ctx.shadowColor = '#aa00ff';
+      ctx.fillText('⚠ RISK', 0, -p.radius - 12);
+      ctx.restore();
+    }
+  }
+
+  // ── Neon Coin visuals ──────────────────────────────────────────────────────
+  _drawCoins(ctx) {
+    for (const c of this.coins) {
+      const ox = this._laneX(c.lane);
+      const bob = Math.sin(c.phase) * 6;
+      const squash = Math.max(0.25, Math.abs(Math.cos(c.spin)));
+
+      ctx.save();
+      ctx.translate(ox, c.y + bob);
+
+      // Outer glow halo
+      const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, c.radius * 2.2);
+      grad.addColorStop(0,   'rgba(255,215,0,0.55)');
+      grad.addColorStop(0.5, 'rgba(255,180,0,0.18)');
+      grad.addColorStop(1,   'rgba(255,180,0,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(0, 0, c.radius * 2.2, 0, Math.PI * 2); ctx.fill();
+
+      // Coin body (squashed on X to fake a spinning disc)
+      ctx.scale(squash, 1);
+      ctx.shadowBlur = 14; ctx.shadowColor = '#ffd700';
+      ctx.fillStyle = '#ffe066';
+      ctx.strokeStyle = '#ffb700';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(0, 0, c.radius, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+
+      ctx.fillStyle = '#fff8dc';
+      ctx.font = `bold ${Math.floor(c.radius * 1.1)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('¢', 0, 1);
+      ctx.textBaseline = 'alphabetic';
+
+      ctx.restore();
+    }
+  }
+
+  _drawRiskOverlay(ctx) {
+    if (this.riskPhase === 'IDLE') return;
+    const a = this.riskIntensity;
+    if (a <= 0) return;
+    ctx.save();
+
+    // Strong pulsing red/violet vignette - unmistakably a heightened state
+    const grad = ctx.createRadialGradient(
+      this.width/2, this.height/2, this.height * 0.18,
+      this.width/2, this.height/2, this.height * 0.78
+    );
+    grad.addColorStop(0, 'rgba(0,0,0,0)');
+    grad.addColorStop(1, `rgba(140,0,70,${0.4 * a})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, this.width, this.height);
+
+    const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 180);
+    ctx.fillStyle = `rgba(220,0,140,${0.06 * a * pulse})`;
+    ctx.fillRect(0, 0, this.width, this.height);
+
+    ctx.restore();
+  }
+
+  _drawParticles(ctx) {
+    for (const p of this.particles) {
+      if (p.life <= 0) continue;
+      ctx.globalAlpha = Math.max(0, p.life);
+      ctx.fillStyle   = p.color;
+      ctx.shadowBlur  = 10; ctx.shadowColor = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+  }
+
+  // ── Dynamic Event visuals ─────────────────────────────────────────────────
+  _drawGlitchOverlay(ctx) {
+    if (this.dynType !== 'GLITCH' || this.dynPhase === 'IDLE' || this.dynPhase === 'WARNING') return;
+    const a = this.dynIntensity;
+    if (a <= 0) return;
+    ctx.save();
+
+    // Color shift wash (hue cycles for an electric feel)
+    const hue = (Date.now() / 4) % 360;
+    ctx.fillStyle = `hsla(${hue},100%,55%,${0.06 * a})`;
+    ctx.fillRect(0, 0, this.width, this.height);
+
+    // Glitch slices (RGB-split style bands)
+    ctx.globalCompositeOperation = 'lighter';
+    for (const g of this.glitchSlices) {
+      ctx.fillStyle = g.color;
+      ctx.globalAlpha = 0.18 * a;
+      ctx.fillRect(g.dx, g.y, this.width, g.h);
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+
+    // Faint scanlines
+    ctx.strokeStyle = `rgba(0,255,255,${0.05 * a})`;
+    ctx.lineWidth = 1;
+    for (let y = 0; y < this.height; y += 4) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(this.width, y); ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  _drawBlackoutOverlay(ctx) {
+    if (this.dynType !== 'BLACKOUT' || this.dynPhase === 'IDLE' || this.dynPhase === 'WARNING') return;
+    const a = this.dynIntensity;
+    if (a <= 0) return;
+    ctx.save();
+
+    ctx.fillStyle = `rgba(0,0,0,${0.96 * a})`;
+    ctx.fillRect(0, 0, this.width, this.height);
+
+    // Punch a soft circle of light around the player
+    ctx.globalCompositeOperation = 'destination-out';
+    const r = Math.max(this.width, this.height) * 0.16;
+    const holeGrad = ctx.createRadialGradient(this.playerX, this.playerY, 0, this.playerX, this.playerY, r);
+    holeGrad.addColorStop(0, `rgba(0,0,0,${a})`);
+    holeGrad.addColorStop(0.65, `rgba(0,0,0,${0.55 * a})`);
+    holeGrad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = holeGrad;
+    ctx.beginPath();
+    ctx.arc(this.playerX, this.playerY, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  // ── Level Up celebration ──────────────────────────────────────────────────
+  _drawLevelUpEffect(ctx) {
+    if (this.levelUpTimer <= 0) return;
+    const T = 2.4;
+    const t = 1 - (this.levelUpTimer / T);      // 0 -> 1 over the effect's lifetime
+    const cx = this.width / 2, cy = this.height * 0.38;
+
+    ctx.save();
+
+    // Expanding ring burst
+    const ringCount = 3;
+    for (let i = 0; i < ringCount; i++) {
+      const delay = i * 0.12;
+      const rt = Math.max(0, Math.min(1, (t - delay) / 0.85));
+      if (rt <= 0) continue;
+      const r = rt * (this.width * 0.5);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(255,215,0,${(1 - rt) * 0.6})`;
+      ctx.lineWidth = 4;
+      ctx.shadowBlur = 20; ctx.shadowColor = '#ffd700';
+      ctx.stroke();
+    }
+
+    // Pop-in / fade-out text
+    const inT  = Math.min(1, t / 0.18);
+    const outT = Math.max(0, Math.min(1, (t - 0.75) / 0.25));
+    const scale = (0.6 + 0.4 * inT) * (1 + 0.15 * Math.sin(t * Math.PI * 6) * (1 - t));
+    const alpha = inT * (1 - outT);
+
+    ctx.globalAlpha = alpha;
+    ctx.translate(cx, cy);
+    ctx.scale(scale, scale);
+    ctx.textAlign = 'center';
+
+    ctx.font = 'bold 30px monospace';
+    ctx.fillStyle = '#fff';
+    ctx.shadowBlur = 12; ctx.shadowColor = '#ffd700';
+    ctx.fillText('LEVEL UP', 0, -22);
+
+    ctx.font = 'bold 56px monospace';
+    ctx.fillStyle = '#ffd700';
+    ctx.shadowBlur = 24;
+    ctx.fillText(`${this.levelUpLevel}`, 0, 40);
+
+    ctx.restore();
+  }
+
+  _drawUI(ctx) {
+    for (const t of this.texts) {
+      ctx.globalAlpha = Math.max(0, t.life);
+      ctx.fillStyle   = t.color;
+      ctx.font        = 'bold 24px monospace';
+      ctx.textAlign   = 'center';
+      ctx.fillText(t.text, t.x, t.y);
+    }
+    ctx.globalAlpha = 1;
+
+    if (this.state === 'MENU') {
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 64px monospace';
+      const text = 'NEON RUNNER';
+      let tx = this.width/2 - (ctx.measureText(text).width / 2);
+      for (let i=0; i<text.length; i++) {
+        const cycle = (Date.now() / 500 + i * 0.2) % (Math.PI * 2);
+        const r = Math.floor(170 * (Math.sin(cycle)+1)/2);
+        const g = Math.floor(255 * (1 - (Math.sin(cycle)+1)/2));
+        const b = 255;
+        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        ctx.shadowBlur = 20; ctx.shadowColor = ctx.fillStyle;
+        const charW = ctx.measureText(text[i]).width;
+        ctx.fillText(text[i], tx + charW/2, this.height * 0.30);
+        tx += charW;
+      }
+      
+      ctx.shadowBlur = 0;
+      ctx.font = '16px monospace';
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.fillText('HOW FAR CAN YOU GO?', this.width/2, this.height * 0.35);
+
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+      ctx.strokeStyle = '#00ffff';
+      ctx.lineWidth = 2;
+      ctx.shadowBlur = 10; ctx.shadowColor = '#00ffff';
+      ctx.strokeRect(this.width/2 - 120, this.height * 0.40, 240, 40);
+      ctx.shadowBlur = 0;
+      ctx.font = '20px monospace';
+      ctx.fillStyle = '#fff';
+      ctx.fillText(`HIGH SCORE: ${this.highScore}`, this.width/2, this.height * 0.40 + 26);
+
+      // Persistent player profile summary
+      ctx.font = '14px monospace';
+      ctx.fillStyle = '#66ddff';
+      ctx.shadowBlur = 6; ctx.shadowColor = '#66ddff';
+      ctx.fillText(`LEVEL ${this.profile.level}`, this.width/2 - 90, this.height * 0.40 + 52);
+      ctx.fillStyle = '#ffd700';
+      ctx.shadowColor = '#ffd700';
+      ctx.fillText(`¢ ${this.profile.coins}`, this.width/2, this.height * 0.40 + 52);
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.shadowBlur = 0;
+      ctx.fillText(`${this.profile.gamesPlayed} RUNS`, this.width/2 + 90, this.height * 0.40 + 52);
+
+      const btnPulse = this.hoverPlay ? 1.2 + 0.05*Math.sin(Date.now()/150) : 1;
+      ctx.save();
+      ctx.translate(this.width/2, this.height * 0.60);
+      ctx.scale(btnPulse, btnPulse);
+      ctx.strokeStyle = '#00ffff';
+      ctx.fillStyle = this.hoverPlay ? 'rgba(0,255,255,0.2)' : 'rgba(0,0,0,0.5)';
+      ctx.shadowBlur = 15; ctx.shadowColor = '#00ffff';
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(-80, -25, 160, 50, 10);
+      else ctx.rect(-80, -25, 160, 50);
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#fff'; ctx.shadowBlur = 0;
+      ctx.font = '24px monospace'; ctx.textAlign = 'center';
+      ctx.fillText('PLAY', 0, 8);
+      ctx.restore();
+      
+      ctx.fillStyle = '#fff';
+      ctx.font = '16px monospace';
+      ctx.globalAlpha = 0.5;
+      ctx.fillText('Or tap anywhere', this.width/2, this.height * 0.60 + 50);
+      ctx.globalAlpha = 1;
+
+    } else if (this.state === 'PLAYING' || this.state === 'DEATH') {
+      if (this.currentEvent === 'SCORE_SURGE' || (this.dynType === 'SPEEDRUSH' && this.dynPhase !== 'IDLE')) {
+         ctx.shadowBlur = 15; ctx.shadowColor = '#ffd700'; ctx.fillStyle = '#ffd700';
+      } else {
+         ctx.shadowBlur = 10; ctx.shadowColor = '#fff'; ctx.fillStyle = '#fff';
+      }
+      ctx.textAlign = 'left'; ctx.font = 'bold 32px monospace';
+      ctx.fillText(`SCORE: ${Math.floor(this.score)}`, 20, 40);
+
+      // Coin counter
+      ctx.shadowBlur = 8; ctx.shadowColor = '#ffd700';
+      ctx.fillStyle = '#ffd700';
+      ctx.font = 'bold 18px monospace';
+      ctx.fillText(`¢ ${this.profile.coins}`, 20, 66);
+
+      // Level + XP progress bar
+      const need = this.profile.xpForLevel(this.profile.level);
+      const prog = Math.max(0, Math.min(1, this.profile.xp / need));
+      ctx.shadowBlur = 0;
+      ctx.font = 'bold 14px monospace';
+      ctx.fillStyle = '#66ddff';
+      ctx.fillText(`LV ${this.profile.level}`, 20, 90);
+      ctx.fillStyle = 'rgba(255,255,255,0.15)';
+      ctx.fillRect(70, 80, 110, 8);
+      ctx.fillStyle = '#66ddff';
+      ctx.shadowBlur = 8; ctx.shadowColor = '#66ddff';
+      ctx.fillRect(70, 80, 110 * prog, 8);
+      ctx.shadowBlur = 0;
+      
+      if (this.combo > 1) {
+        ctx.textAlign   = 'center';
+        ctx.fillStyle   = '#00ff88'; ctx.shadowColor = '#00ff88';
+        ctx.fillText(`COMBO x${this.combo}`, this.width/2, 40);
+      }
+      
+      if (this.inversionState === 'WARNING') {
+        ctx.textAlign = 'center';
+        ctx.fillStyle = (Math.floor(Date.now() / 150) % 2 === 0) ? '#ff0000' : '#ffffff';
+        ctx.shadowColor = ctx.fillStyle;
+        ctx.font = 'bold 40px monospace';
+        const sec = Math.ceil(this.inversionWarningTimer);
+        ctx.fillText(`!! INVERTING IN ${sec}...`, this.width/2, this.height/2);
+      } else if (this.inversionState === 'ACTIVE') {
+        ctx.textAlign = 'center';
+        const p = 0.5 + 0.5 * Math.sin(Date.now() / 100);
+        ctx.fillStyle = `rgba(255, 0, 85, ${p})`;
+        ctx.shadowColor = '#ff0055';
+        ctx.font = 'bold 30px monospace';
+        ctx.fillText('!! CONTROLS INVERTED !!', this.width/2, this.height/2);
+      }
+
+      // Dynamic Event warning animation (pre-activation)
+      if (this.dynPhase === 'WARNING') {
+        ctx.save();
+        const flicker = Math.floor(Date.now() / 90) % 2 === 0;
+        if (this.dynType === 'GLITCH') {
+          ctx.strokeStyle = flicker ? '#ff00ff' : '#00ffff';
+          ctx.lineWidth = 6;
+          ctx.shadowBlur = 20; ctx.shadowColor = ctx.strokeStyle;
+          ctx.strokeRect(4, 4, this.width - 8, this.height - 8);
+          ctx.textAlign = 'center';
+          ctx.font = 'bold 26px monospace';
+          ctx.fillStyle = ctx.strokeStyle;
+          ctx.fillText('SIGNAL UNSTABLE...', this.width/2, this.height * 0.42);
+        } else if (this.dynType === 'BLACKOUT') {
+          const t = 1 - Math.max(0, this.dynWarningTimer / 0.9);
+          ctx.fillStyle = `rgba(0,0,0,${0.35 * t})`;
+          ctx.fillRect(0, 0, this.width, this.height);
+          ctx.textAlign = 'center';
+          ctx.font = 'bold 26px monospace';
+          ctx.fillStyle = flicker ? '#8888ff' : '#4444aa';
+          ctx.shadowBlur = 15; ctx.shadowColor = '#4444ff';
+          ctx.fillText('LIGHTS FAILING...', this.width/2, this.height * 0.42);
+        } else if (this.dynType === 'SPEEDRUSH') {
+          ctx.strokeStyle = flicker ? '#ffaa00' : '#ff5500';
+          ctx.lineWidth = 4;
+          ctx.shadowBlur = 15; ctx.shadowColor = ctx.strokeStyle;
+          ctx.strokeRect(4, 4, this.width - 8, this.height - 8);
+          ctx.textAlign = 'center';
+          ctx.font = 'bold 26px monospace';
+          ctx.fillStyle = ctx.strokeStyle;
+          ctx.fillText('ENGINES CHARGING...', this.width/2, this.height * 0.42);
+        }
+        ctx.restore();
+      }
+      
+      if (this.eventBannerTimer > 0) {
+         ctx.save();
+         ctx.textAlign = 'center';
+         ctx.font = 'bold 48px monospace';
+         ctx.globalAlpha = Math.min(1, this.eventBannerTimer / 0.5);
+         ctx.fillStyle = '#ff00ff';
+         ctx.shadowBlur = 20; ctx.shadowColor = '#ff00ff';
+         ctx.fillText(this.eventBanner, this.width/2, this.height/3);
+         ctx.restore();
+      }
+
+      if (this.riskPhase !== 'IDLE') {
+        ctx.save();
+        ctx.globalAlpha = this.riskIntensity;
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 20px monospace';
+        ctx.fillStyle = '#ff0066';
+        ctx.shadowBlur = 15; ctx.shadowColor = '#ff0066';
+        const secs = Math.max(0, this.riskTimer).toFixed(1);
+        ctx.fillText(`⚠ RISK MODE x${this.riskScoreMult} — ${secs}s`, this.width/2, 70);
+        ctx.restore();
+      }
+      
+      if (this.state === 'PLAYING') {
+        ctx.save();
+        ctx.translate(this.width - 130, this.height - 90);
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.strokeStyle = '#4400aa';
+        ctx.lineWidth = 1;
+        ctx.shadowBlur = 0;
+        ctx.fillRect(0, 0, 120, 80);
+        ctx.strokeRect(0, 0, 120, 80);
+        
+        ctx.font = '10px monospace';
+        ctx.textAlign = 'left';
+        let y = 15;
+        for (const obj of this.activeObjectives) {
+          if (obj.completed) {
+            if (obj.flashTimer > 0) ctx.fillStyle = (Math.floor(obj.flashTimer * 10) % 2 === 0) ? '#ffd700' : '#fff';
+            else ctx.fillStyle = '#888';
+          } else {
+            ctx.fillStyle = '#fff';
+          }
+          ctx.fillText(obj.text, 5, y);
+          
+          ctx.fillStyle = '#333';
+          ctx.fillRect(5, y + 4, 110, 4);
+          ctx.fillStyle = obj.completed ? '#ffd700' : '#00ff88';
+          const prog = Math.min(1, obj.get() / obj.target);
+          ctx.fillRect(5, y + 4, 110 * prog, 4);
+          
+          if (obj.completed) {
+            ctx.strokeStyle = '#ffd700';
+            ctx.beginPath(); ctx.moveTo(3, y - 3); ctx.lineTo(115, y - 3); ctx.stroke();
+          }
+          y += 25;
+        }
+        ctx.restore();
+      }
+
+    } else if (this.state === 'GAMEOVER') {
+      const goFade = Math.min(1, (Date.now() - this.gameOverStartTime) / 500);
+      ctx.globalAlpha = goFade;
+      
+      if (this.newRecord) {
+         ctx.save();
+         ctx.translate(this.width/2, this.height * 0.25);
+         ctx.rotate(Date.now() / 1000);
+         const pulse = 1 + 0.2 * Math.sin(Date.now()/200);
+         ctx.scale(pulse, pulse);
+         ctx.strokeStyle = '#ffd700';
+         ctx.shadowBlur = 10; ctx.shadowColor = '#ffd700';
+         ctx.lineWidth = 2;
+         for(let i=0; i<12; i++) {
+           ctx.beginPath();
+           ctx.moveTo(0, 20); ctx.lineTo(0, 100);
+           ctx.stroke();
+           ctx.rotate(Math.PI / 6);
+         }
+         ctx.restore();
+      }
+      
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(0,0,0,0.8)';
+      ctx.fillRect(this.width/2 - 170, this.height * 0.25, 340, 240);
+      ctx.strokeStyle = '#ff0055'; ctx.lineWidth = 2;
+      ctx.strokeRect(this.width/2 - 170, this.height * 0.25, 340, 240);
+      
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 36px monospace';
+      ctx.fillStyle = '#ff0055';
+      ctx.shadowBlur = 10; ctx.shadowColor = '#ff0055';
+      ctx.fillText('GAME OVER', this.width/2, this.height * 0.25 + 40);
+      ctx.shadowBlur = 0;
+
+      ctx.font = '16px monospace';
+      ctx.fillStyle = '#aaa';
+      ctx.textAlign = 'right';
+      const lx = this.width/2 - 10;
+      const rx = this.width/2 + 10;
+      ctx.fillText('FINAL SCORE:', lx, this.height * 0.25 + 80);
+      ctx.fillText('HIGH SCORE:', lx, this.height * 0.25 + 110);
+      ctx.fillText('SURVIVAL TIME:', lx, this.height * 0.25 + 140);
+      ctx.fillText('HIGHEST COMBO:', lx, this.height * 0.25 + 170);
+      ctx.fillText('NEAR MISSES:', lx, this.height * 0.25 + 200);
+
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'left';
+      ctx.fillText(Math.floor(this.score), rx, this.height * 0.25 + 80);
+      ctx.fillText(this.highScore, rx, this.height * 0.25 + 110);
+      const mins = Math.floor(this.gameTime / 60).toString().padStart(2, '0');
+      const secs = Math.floor(this.gameTime % 60).toString().padStart(2, '0');
+      ctx.fillText(`${mins}:${secs}`, rx, this.height * 0.25 + 140);
+      ctx.fillText(`x${this.maxComboReached}`, rx, this.height * 0.25 + 170);
+      ctx.fillText(this.nearMissCount, rx, this.height * 0.25 + 200);
+
+      // Progression recap for this run
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 15px monospace';
+      ctx.fillStyle = '#ffd700';
+      ctx.shadowBlur = 6; ctx.shadowColor = '#ffd700';
+      ctx.fillText(`+${this.sessionCoinsEarned} COINS`, this.width/2 - 80, this.height * 0.25 + 230);
+      ctx.fillStyle = '#66ddff';
+      ctx.shadowColor = '#66ddff';
+      ctx.fillText(`+${this.sessionXPEarned} XP`, this.width/2 + 10, this.height * 0.25 + 230);
+      ctx.shadowBlur = 0;
+      ctx.font = '13px monospace';
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.fillText(`LEVEL ${this.profile.level}  •  ${this.profile.coins} TOTAL COINS`, this.width/2, this.height * 0.25 + 250);
+
+      const rBtnPulse = this.hoverRestart ? 1.2 + 0.05*Math.sin(Date.now()/150) : 1;
+      ctx.save();
+      ctx.translate(this.width/2, this.height * 0.25 + 300);
+      ctx.scale(rBtnPulse, rBtnPulse);
+      ctx.strokeStyle = '#00ffff';
+      ctx.fillStyle = this.hoverRestart ? 'rgba(0,255,255,0.2)' : 'rgba(0,0,0,0.5)';
+      ctx.shadowBlur = 15; ctx.shadowColor = '#00ffff';
+      ctx.beginPath();
+      if(ctx.roundRect) ctx.roundRect(-80, -25, 160, 50, 10);
+      else ctx.rect(-80, -25, 160, 50);
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#fff'; ctx.shadowBlur = 0;
+      ctx.font = '24px monospace'; ctx.textAlign = 'center';
+      ctx.fillText('RESTART', 0, 8);
+      ctx.restore();
+      
+      ctx.fillStyle = '#fff';
+      ctx.font = '16px monospace';
+      ctx.globalAlpha = 0.5;
+      ctx.fillText('Or tap anywhere', this.width/2, this.height * 0.25 + 350);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.shadowBlur = 0;
+  }
+}
+
+// ─── Bootstrap ───────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const engine = new GameEngine();
+
+function resize() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+  engine.resize(canvas.width, canvas.height);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Keyboard
+window.addEventListener('keydown', e => {
+  audio.init();
+  if (e.code === 'ArrowLeft'  || e.code === 'KeyA') engine.handleInput('LEFT');
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') engine.handleInput('RIGHT');
+  if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); engine.handleInput('ACTION'); }
+});
+
+// Mouse hover
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  engine.mouseX = (e.clientX - rect.left) * (canvas.width / rect.width);
+  engine.mouseY = (e.clientY - rect.top) * (canvas.height / rect.height);
+});
+
+// Touch / click
+let touchX = 0, touchY = 0, touchT = 0;
+canvas.addEventListener('touchstart', e => {
+  audio.init();
+  touchX = e.touches[0].clientX;
+  touchY = e.touches[0].clientY;
+  touchT = performance.now();
+}, { passive: true });
+
+canvas.addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - touchX;
+  const dy = e.changedTouches[0].clientY - touchY;
+  const dt = performance.now() - touchT;
+  if (Math.abs(dx) > 30 && Math.abs(dx) > Math.abs(dy)) {
+    engine.handleInput(dx > 0 ? 'RIGHT' : 'LEFT');
+  } else if (dt < 300) {
+    engine.handleInput('ACTION');
+  }
+}, { passive: true });
+
+canvas.addEventListener('click', () => {
+  audio.init();
+  if (engine.state === 'MENU' || engine.state === 'GAMEOVER') engine.handleInput('ACTION');
+});
+
+// Game loop
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  engine.update(dt);
+  engine.draw(ctx);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
